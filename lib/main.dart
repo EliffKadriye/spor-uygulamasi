@@ -1,12 +1,76 @@
 import 'dart:async';
 import 'dart:convert';
 import 'package:flutter/material.dart';
+import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:pedometer/pedometer.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 void main() {
   runApp(const SporUygulamasi());
+}
+
+// ============================================
+// BİLDİRİM SERVİSİ: Adım sayısını bildirim
+// çubuğunda gösterir/günceller (uygulama arka
+// planda çalıştığı sürece - tamamen kapatılırsa
+// güncellenmeyi durdurur, native "foreground
+// service" olmadan bu mümkün değil).
+// ============================================
+class BildirimServisi {
+  static final FlutterLocalNotificationsPlugin _eklenti =
+      FlutterLocalNotificationsPlugin();
+  static bool _hazirlandi = false;
+  static const int _bildirimId = 100;
+
+ static Future<void> hazirla() async {
+  if (_hazirlandi) return;
+  
+  const androidAyarlari = AndroidInitializationSettings('@mipmap/ic_launcher');
+  const ayarlar = InitializationSettings(android: androidAyarlari);
+  await _eklenti.initialize(ayarlar);
+
+  // Android 8.0+ için bildirim kanalı oluşturma
+  const AndroidNotificationChannel kanal = AndroidNotificationChannel(
+    'adim_sayar_kanal', // NotificationDetails içindeki ID ile BİREBİR AYNI olmalı
+    'Adım Sayar',
+    description: 'Günlük adım sayınızı gösterir',
+    importance: Importance.low,
+  );
+
+  await _eklenti
+      .resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>()
+      ?.createNotificationChannel(kanal);
+
+  _hazirlandi = true;
+}
+
+  static Future<void> adimBildirimiGuncelle(int adim, int hedef) async {
+    await hazirla();
+    final oran = hedef > 0 ? (adim / hedef * 100).clamp(0, 100).round() : 0;
+    const androidDetay = AndroidNotificationDetails(
+      'adim_sayar_kanal',
+      'Adım Sayar',
+      channelDescription: 'Günlük adım sayınızı gösterir',
+      importance: Importance.low,
+      priority: Priority.low,
+      ongoing: true, // kullanıcı kaydırarak kapatamaz
+      autoCancel: false,
+      showWhen: false,
+      icon: '@mipmap/ic_launcher',
+    );
+    const detaylar = NotificationDetails(android: androidDetay);
+    await _eklenti.show(
+      _bildirimId,
+      'AsanaFit',
+      '$adim adım • Hedefin %$oran\'i',
+      detaylar,
+    );
+  }
+
+  static Future<void> bildirimiKapat() async {
+    await _eklenti.cancel(_bildirimId);
+  }
 }
 
 // ============================================
@@ -549,7 +613,7 @@ class _SplashEkraniState extends State<SplashEkrani> with SingleTickerProviderSt
                       ),
                       const SizedBox(height: 30),
                       const Text(
-                        'FitLife',
+                        'AsanaFit',
                         style: TextStyle(
                           fontSize: 40,
                           fontWeight: FontWeight.w700,
@@ -812,7 +876,7 @@ class _SporUygulamasiState extends State<SporUygulamasi> {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'FitLife',
+      title: 'AsanaFit',
       debugShowCheckedModeBanner: false,
       themeMode: _temaModu,
       theme: _buildLightTheme(),
@@ -937,7 +1001,7 @@ class _AnaEkranState extends State<AnaEkran> {
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text('FitLife'),
+        title: const Text('AsanaFit'),
         actions: [
           IconButton(
             icon: Icon(widget.temaModu == ThemeMode.dark ? Icons.light_mode : Icons.dark_mode),
@@ -1624,11 +1688,11 @@ class AdimSayarEkrani extends StatefulWidget {
 
 class _AdimSayarEkraniState extends State<AdimSayarEkrani> {
   static const String _anahtarBaslangicTarih = 'adim_baslangic_tarih';
-  static const String _anahtarBaslangicDeger = 'adim_baslangic_deger';
   static const String _anahtarHedef = 'adim_hedef';
   static const String _anahtarHaftalikVeri = 'haftalik_adim_verisi';
   static const int varsayilanHedef = 8000;
-
+  static const String _anahtarSonHamDeger = 'son_ham_sensor_degeri';
+  static const String _anahtarBugunToplam = 'bugun_toplam_adim';
   Stream<StepCount>? _stepCountStream;
   StreamSubscription<StepCount>? _subscription;
   
@@ -1645,7 +1709,38 @@ class _AdimSayarEkraniState extends State<AdimSayarEkrani> {
     super.initState();
     _hedefiYukle();
     _haftalikVeriyiYukle();
+    _bugunToplamiYukle(); // ✅ FIX: kayıtlı bugünkü adımı hemen göster, sensörden ilk olayı bekleme
     _adimSayariniBaslat();
+  }
+
+  // ✅ FIX: BUGÜNKÜ TOPLAMI HEMEN YÜKLE
+  // Daha önce kaydedilmiş "bugun_toplam_adim" değerini SharedPreferences'tan
+  // okuyup ekrana/bildirime hemen yazar. Böylece kullanıcı uygulamayı açtığında
+  // yeni bir sensör olayı (yani fiziksel bir adım) gelene kadar beklemek zorunda kalmaz.
+  Future<void> _bugunToplamiYukle() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final bugun = _tarihAnahtari(DateTime.now());
+      final kayitliTarih = prefs.getString(_anahtarBaslangicTarih);
+
+      // Kayıtlı tarih bugünle aynıysa, kayıtlı toplamı ve ham sensör değerini geri yükle
+      final int kayitliToplam = (kayitliTarih == bugun)
+          ? (prefs.getInt(_anahtarBugunToplam) ?? 0)
+          : 0;
+      final int? kayitliHam = prefs.getInt(_anahtarSonHamDeger);
+
+      if (mounted) {
+        setState(() {
+          _gunlukAdim = kayitliToplam;
+          _sonHamDeger = kayitliHam;
+        });
+        if (kayitliToplam > 0) {
+          BildirimServisi.adimBildirimiGuncelle(_gunlukAdim, _gunlukHedef);
+        }
+      }
+    } catch (e) {
+      debugPrint('Bugünkü toplam yükleme hatası: $e');
+    }
   }
 
   // ✅ HEDEF YÜKLE
@@ -1705,6 +1800,8 @@ class _AdimSayarEkraniState extends State<AdimSayarEkrani> {
     try {
       // İzin kontrolü
       final status = await Permission.activityRecognition.request();
+      // Android 13+ için bildirim izni ayrıca istenmeli
+      await Permission.notification.request();
       
       if (!status.isGranted) {
         setState(() {
@@ -1740,6 +1837,7 @@ class _AdimSayarEkraniState extends State<AdimSayarEkrani> {
         setState(() {
           _yukleniyor = false;
         });
+        BildirimServisi.adimBildirimiGuncelle(_gunlukAdim, _gunlukHedef);
       }
 
     } catch (e) {
@@ -1752,47 +1850,51 @@ class _AdimSayarEkraniState extends State<AdimSayarEkrani> {
   }
 
   // ✅ ADIM GELDİĞİNDE 
-  void _onStepCount(StepCount event) async {
-    try {
-      debugPrint('📊 Adım geldi: ${event.steps}');
-      
-      _sonHamDeger = event.steps;
+void _onStepCount(StepCount event) async {
+  try {
+    final prefs = await SharedPreferences.getInstance();
+    final bugun = _tarihAnahtari(DateTime.now());
+    final kayitliTarih = prefs.getString(_anahtarBaslangicTarih);
 
-      final prefs = await SharedPreferences.getInstance();
-      final bugun = _tarihAnahtari(DateTime.now());
-      final kayitliTarih = prefs.getString(_anahtarBaslangicTarih);
+    int bugunToplam = prefs.getInt(_anahtarBugunToplam) ?? 0;
+    final int? sonGorulenHam = prefs.getInt(_anahtarSonHamDeger);
 
-      int baslangicDegeri;
-      if (kayitliTarih != bugun) {
-        // Yeni gün
-        baslangicDegeri = event.steps;
-        await prefs.setString(_anahtarBaslangicTarih, bugun);
-        await prefs.setInt(_anahtarBaslangicDeger, baslangicDegeri);
-        debugPrint('📅 Yeni gün başlangıcı: $baslangicDegeri');
+    if (kayitliTarih != bugun) {
+      bugunToplam = 0;
+      await prefs.setString(_anahtarBaslangicTarih, bugun);
+    } else if (sonGorulenHam != null) {
+      if (event.steps >= sonGorulenHam) {
+        bugunToplam += (event.steps - sonGorulenHam);
       } else {
-        baslangicDegeri = prefs.getInt(_anahtarBaslangicDeger) ?? event.steps;
+        bugunToplam += event.steps;
       }
-
-      final bugunkuAdim = (event.steps - baslangicDegeri).clamp(0, event.steps);
-      debugPrint('👣 Bugünkü adım: $bugunkuAdim');
-
-      // Haftalık veriyi güncelle
-      final now = DateTime.now();
-      final gunIndex = now.weekday - 1;
-      if (_haftalikVeri.length != 7) _haftalikVeri = List.filled(7, 0);
-      _haftalikVeri[gunIndex] = bugunkuAdim;
-      await _haftalikVeriyiKaydet();
-
-      if (mounted) {
-        setState(() {
-          _gunlukAdim = bugunkuAdim;
-          _yukleniyor = false;
-        });
-      }
-    } catch (e) {
-      debugPrint('❌ Adım işleme hatası: $e');
     }
+
+    // İlk kez sensör verisi geliyorsa anchor olarak kaydet
+    await prefs.setInt(_anahtarSonHamDeger, event.steps);
+    await prefs.setInt(_anahtarBugunToplam, bugunToplam);
+
+    _sonHamDeger = event.steps;
+
+    // ✅ FIX: Haftalık grafik verisini de güncelle ve kaydet.
+    // Daha önce bu adım hiç atılmıyordu, bu yüzden sütun grafik hep sıfır kalıyordu.
+    final gunIndex = DateTime.now().weekday - 1; // 0=Pzt ... 6=Paz
+    if (gunIndex >= 0 && gunIndex < _haftalikVeri.length) {
+      _haftalikVeri[gunIndex] = bugunToplam;
+      await _haftalikVeriyiKaydet();
+    }
+    
+    if (mounted) {
+      setState(() {
+        _gunlukAdim = bugunToplam;
+        _yukleniyor = false;
+      });
+      BildirimServisi.adimBildirimiGuncelle(_gunlukAdim, _gunlukHedef);
+    }
+  } catch (e) {
+    debugPrint('Hata: $e');
   }
+}
 
   // ✅ HATA YÖNETİMİ
   void _onError(Object error) {
@@ -1814,19 +1916,30 @@ class _AdimSayarEkraniState extends State<AdimSayarEkrani> {
   String _tarihAnahtari(DateTime tarih) => '${tarih.year}-${tarih.month}-${tarih.day}';
 
   // ✅ GÜNLÜK SAYACI SIFIRLA
-  Future<void> _gunlukSayaciSifirla() async {
-    if (_sonHamDeger == null) return;
-    try {
-      final prefs = await SharedPreferences.getInstance();
-      final bugun = _tarihAnahtari(DateTime.now());
-      await prefs.setString(_anahtarBaslangicTarih, bugun);
-      await prefs.setInt(_anahtarBaslangicDeger, _sonHamDeger!);
-      setState(() => _gunlukAdim = 0);
-      debugPrint('🔄 Adım sayacı sıfırlandı');
-    } catch (e) {
-      debugPrint('❌ Sıfırlama hatası: $e');
+  
+Future<void> _gunlukSayaciSifirla() async {
+  if (_sonHamDeger == null) return;
+  try {
+    final prefs = await SharedPreferences.getInstance();
+    final bugun = _tarihAnahtari(DateTime.now());
+    await prefs.setString(_anahtarBaslangicTarih, bugun);
+    await prefs.setInt(_anahtarSonHamDeger, _sonHamDeger!);
+    await prefs.setInt(_anahtarBugunToplam, 0);
+
+    // ✅ FIX: bugünün haftalık grafik sütununu da sıfırla
+    final gunIndex = DateTime.now().weekday - 1;
+    if (gunIndex >= 0 && gunIndex < _haftalikVeri.length) {
+      _haftalikVeri[gunIndex] = 0;
+      await _haftalikVeriyiKaydet();
     }
+
+    setState(() => _gunlukAdim = 0);
+    debugPrint('🔄 Adım sayacı sıfırlandı');
+  } catch (e) {
+    debugPrint('❌ Sıfırlama hatası: $e');
   }
+}
+  
 
   @override
   void dispose() {
