@@ -1689,7 +1689,9 @@ class AdimSayarEkrani extends StatefulWidget {
 class _AdimSayarEkraniState extends State<AdimSayarEkrani> {
   static const String _anahtarBaslangicTarih = 'adim_baslangic_tarih';
   static const String _anahtarHedef = 'adim_hedef';
-  static const String _anahtarHaftalikVeri = 'haftalik_adim_verisi';
+  // ⚠️ ESKİ: 'haftalik_adim_verisi' sabit 7 elemanlı diziydi (hangi haftaya
+  // ait olduğunu bilmiyordu). Artık her günü kendi TARİHİYLE saklıyoruz.
+  static const String _anahtarGunlukAdimMap = 'gunluk_adim_map';
   static const int varsayilanHedef = 8000;
   static const String _anahtarSonHamDeger = 'son_ham_sensor_degeri';
   static const String _anahtarBugunToplam = 'bugun_toplam_adim';
@@ -1702,13 +1704,15 @@ class _AdimSayarEkraniState extends State<AdimSayarEkrani> {
   bool _izinVerildi = false;
   bool _yukleniyor = true;
   String _durumMesaji = '';
-  List<int> _haftalikVeri = List.filled(7, 0);
+  // ✅ FIX: tarih -> adım eşlemesi. Artık haftanın hangi günü olduğuna göre
+  // sabit bir index'e yazmıyoruz, gerçek takvim tarihine yazıyoruz.
+  Map<String, int> _gunlukAdimMap = {};
 
   @override
   void initState() {
     super.initState();
     _hedefiYukle();
-    _haftalikVeriyiYukle();
+    _gunlukAdimMapYukle();
     _bugunToplamiYukle(); // ✅ FIX: kayıtlı bugünkü adımı hemen göster, sensörden ilk olayı bekleme
     _adimSayariniBaslat();
   }
@@ -1756,32 +1760,67 @@ class _AdimSayarEkraniState extends State<AdimSayarEkrani> {
     }
   }
 
-  // ✅ HAFTALIK VERİ YÜKLE
-  Future<void> _haftalikVeriyiYukle() async {
+  // ✅ FIX: GÜNLÜK ADIM MAP'İNİ YÜKLE (tarih -> adım)
+  // Eskiden hafta içindeki 7 sabit "kutuya" (Pzt=0...Paz=6) yazılıyordu ve bu
+  // kutular haftalar arasında hiç sıfırlanmıyordu. Bu yüzden örneğin bu hafta
+  // Salı gününe henüz gelmeden, ekranda geçen haftanın Salı verisi
+  // görünmeye devam ediyordu ("hep aynı hafta dönüyor" hissi buradan geliyordu).
+  // Artık her gün kendi gerçek tarihiyle (ör. "2026-08-24") saklanıyor.
+  Future<void> _gunlukAdimMapYukle() async {
     try {
       final prefs = await SharedPreferences.getInstance();
-      final kayitliVeri = prefs.getString(_anahtarHaftalikVeri);
+      final kayitliVeri = prefs.getString(_anahtarGunlukAdimMap);
       if (kayitliVeri != null) {
-        final List<dynamic> decoded = jsonDecode(kayitliVeri);
-        if (decoded.length == 7) {
-          setState(() => _haftalikVeri = decoded.map((e) => e as int).toList());
-          return;
-        }
+        final Map<String, dynamic> decoded = jsonDecode(kayitliVeri);
+        setState(() {
+          _gunlukAdimMap = decoded.map((k, v) => MapEntry(k, v as int));
+        });
+        return;
       }
     } catch (e) {
-      debugPrint('Haftalık veri yükleme hatası: $e');
+      debugPrint('Günlük adım map yükleme hatası: $e');
     }
-    setState(() => _haftalikVeri = List.filled(7, 0));
+    setState(() => _gunlukAdimMap = {});
   }
 
-  // ✅ HAFTALIK VERİ KAYDET
-  Future<void> _haftalikVeriyiKaydet() async {
+  // ✅ FIX: GÜNLÜK ADIM MAP'İNİ KAYDET
+  // Kayıt büyümesin diye sadece son 30 günü tutuyoruz.
+  Future<void> _gunlukAdimMapKaydet() async {
     try {
+      final bugun = DateTime.now();
+      _gunlukAdimMap.removeWhere((tarihStr, _) {
+        final parcalar = tarihStr.split('-');
+        if (parcalar.length != 3) return true;
+        final tarih = DateTime(
+          int.parse(parcalar[0]),
+          int.parse(parcalar[1]),
+          int.parse(parcalar[2]),
+        );
+        return bugun.difference(tarih).inDays > 30;
+      });
       final prefs = await SharedPreferences.getInstance();
-      await prefs.setString(_anahtarHaftalikVeri, jsonEncode(_haftalikVeri));
+      await prefs.setString(_anahtarGunlukAdimMap, jsonEncode(_gunlukAdimMap));
     } catch (e) {
-      debugPrint('Haftalık veri kaydetme hatası: $e');
+      debugPrint('Günlük adım map kaydetme hatası: $e');
     }
+  }
+
+  // ✅ FIX: Son 7 günü (bugün dahil) GERÇEK TARİHE göre döndürür.
+  // Bu sayede grafik her zaman "gerçek son 7 gün"ü gösterir, hafta değişince
+  // otomatik olarak kayar ve eski haftanın verisi asla yeni haftaya sızmaz.
+  List<MapEntry<DateTime, int>> _sonYediGun() {
+    final bugun = DateTime.now();
+    return List.generate(7, (i) {
+      final tarih = DateTime(bugun.year, bugun.month, bugun.day)
+          .subtract(Duration(days: 6 - i));
+      final anahtar = _tarihAnahtari(tarih);
+      final deger = tarih.day == bugun.day &&
+              tarih.month == bugun.month &&
+              tarih.year == bugun.year
+          ? _gunlukAdim // bugünkü değeri her zaman canlı state'ten al
+          : (_gunlukAdimMap[anahtar] ?? 0);
+      return MapEntry(tarih, deger);
+    });
   }
 
   // ✅ HEDEF KAYDET
@@ -1876,14 +1915,12 @@ void _onStepCount(StepCount event) async {
 
     _sonHamDeger = event.steps;
 
-    // ✅ FIX: Haftalık grafik verisini de güncelle ve kaydet.
-    // Daha önce bu adım hiç atılmıyordu, bu yüzden sütun grafik hep sıfır kalıyordu.
-    final gunIndex = DateTime.now().weekday - 1; // 0=Pzt ... 6=Paz
-    if (gunIndex >= 0 && gunIndex < _haftalikVeri.length) {
-      _haftalikVeri[gunIndex] = bugunToplam;
-      await _haftalikVeriyiKaydet();
-    }
-    
+    // ✅ FIX: Bugünün adımını kendi TARİHİYLE map'e yaz ve kaydet.
+    // Artık haftanın günü index'i değil, gerçek tarih kullanılıyor; böylece
+    // hafta değiştiğinde eski günlerin verisi yeni haftaya karışmıyor.
+    _gunlukAdimMap[bugun] = bugunToplam;
+    await _gunlukAdimMapKaydet();
+
     if (mounted) {
       setState(() {
         _gunlukAdim = bugunToplam;
@@ -1926,12 +1963,9 @@ Future<void> _gunlukSayaciSifirla() async {
     await prefs.setInt(_anahtarSonHamDeger, _sonHamDeger!);
     await prefs.setInt(_anahtarBugunToplam, 0);
 
-    // ✅ FIX: bugünün haftalık grafik sütununu da sıfırla
-    final gunIndex = DateTime.now().weekday - 1;
-    if (gunIndex >= 0 && gunIndex < _haftalikVeri.length) {
-      _haftalikVeri[gunIndex] = 0;
-      await _haftalikVeriyiKaydet();
-    }
+    // ✅ FIX: bugünün map'teki değerini de sıfırla
+    _gunlukAdimMap[bugun] = 0;
+    await _gunlukAdimMapKaydet();
 
     setState(() => _gunlukAdim = 0);
     debugPrint('🔄 Adım sayacı sıfırlandı');
@@ -2000,7 +2034,11 @@ Future<void> _gunlukSayaciSifirla() async {
     final kalori = (_gunlukAdim * 0.04).round();
     final kilometre = (_gunlukAdim * 0.0007).toStringAsFixed(2);
     final kalanHedef = (_gunlukHedef - _gunlukAdim).clamp(0, _gunlukHedef);
-    final maxHaftalik = _haftalikVeri.isEmpty ? 1 : _haftalikVeri.reduce((a, b) => a > b ? a : b);
+    // ✅ FIX: son 7 günü her zaman gerçek tarihlere göre hesapla
+    final sonYediGun = _sonYediGun();
+    final maxHaftalik = sonYediGun.isEmpty
+        ? 1
+        : sonYediGun.map((e) => e.value).reduce((a, b) => a > b ? a : b);
     final gunIsimleri = ['Pzt', 'Sal', 'Çar', 'Per', 'Cum', 'Cmt', 'Paz'];
 
     return Scaffold(
@@ -2135,10 +2173,11 @@ StilKart(
         child: Row(
           mainAxisAlignment: MainAxisAlignment.spaceEvenly,
           children: List.generate(7, (index) {
-            final deger = _haftalikVeri[index];
+            final gun = sonYediGun[index];
+            final deger = gun.value;
             final yukseklik = maxHaftalik > 0 ? (deger / maxHaftalik) * 80 : 0.0;
-            final gunAdi = gunIsimleri[index];
-            final bugunMu = index == DateTime.now().weekday - 1;
+            final gunAdi = gunIsimleri[gun.key.weekday - 1];
+            final bugunMu = index == 6; // liste her zaman bugünle bitiyor
             
             return Container(
               width: 40, // Sabit genişlik
